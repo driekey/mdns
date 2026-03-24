@@ -321,13 +321,15 @@ func (c *client) query(params *QueryParam) error {
 	for {
 		select {
 		case resp := <-msgCh:
-			var inp *ServiceEntry
+			// Track which entries were updated in this response
+			updatedEntries := make(map[string]*ServiceEntry)
 			for _, answer := range append(resp.msg.Answer, resp.msg.Extra...) {
 				// TODO(reddaly): Check that response corresponds to serviceAddr?
 				switch rr := answer.(type) {
 				case *dns.PTR:
 					// Create new entry for this
-					inp = ensureName(inprogress, rr.Ptr)
+					inp := ensureName(inprogress, rr.Ptr)
+					updatedEntries[inp.Name] = inp
 
 				case *dns.SRV:
 					// Check for a target mismatch
@@ -336,26 +338,29 @@ func (c *client) query(params *QueryParam) error {
 					}
 
 					// Get the port
-					inp = ensureName(inprogress, rr.Hdr.Name)
+					inp := ensureName(inprogress, rr.Hdr.Name)
 					inp.Host = rr.Target
 					inp.Port = int(rr.Port)
+					updatedEntries[inp.Name] = inp
 
 				case *dns.TXT:
 					// Pull out the txt
-					inp = ensureName(inprogress, rr.Hdr.Name)
+					inp := ensureName(inprogress, rr.Hdr.Name)
 					inp.Info = strings.Join(rr.Txt, "|")
 					inp.InfoFields = rr.Txt
 					inp.hasTXT = true
+					updatedEntries[inp.Name] = inp
 
 				case *dns.A:
 					// Pull out the IP
-					inp = ensureName(inprogress, rr.Hdr.Name)
+					inp := ensureName(inprogress, rr.Hdr.Name)
 					inp.Addr = rr.A // @Deprecated
 					inp.AddrV4 = rr.A
+					updatedEntries[inp.Name] = inp
 
 				case *dns.AAAA:
 					// Pull out the IP
-					inp = ensureName(inprogress, rr.Hdr.Name)
+					inp := ensureName(inprogress, rr.Hdr.Name)
 					inp.Addr = rr.AAAA   // @Deprecated
 					inp.AddrV6 = rr.AAAA // @Deprecated
 					inp.AddrV6IPAddr = &net.IPAddr{IP: rr.AAAA}
@@ -366,30 +371,33 @@ func (c *client) query(params *QueryParam) error {
 					if rr.AAAA.IsLinkLocalUnicast() || rr.AAAA.IsLinkLocalMulticast() {
 						inp.AddrV6IPAddr.Zone = resp.src.Zone
 					}
+					updatedEntries[inp.Name] = inp
 				}
 			}
 
-			if inp == nil {
-				continue
-			}
-
-			// Check if this entry is complete
-			if inp.complete() {
-				if inp.sent {
+			// Check and send each updated entry, plus any previously incomplete entries that may now be complete
+			for name, inp := range inprogress {
+				if inp == nil || inp.sent {
 					continue
 				}
-				inp.sent = true
-				select {
-				case params.Entries <- inp:
-				default:
+				// Skip if this entry wasn't updated in this response (unless it's already complete)
+				if _, wasUpdated := updatedEntries[name]; !wasUpdated && !inp.complete() {
+					continue
 				}
-			} else {
-				// Fire off a node specific query
-				m := new(dns.Msg)
-				m.SetQuestion(inp.Name, dns.TypePTR)
-				m.RecursionDesired = false
-				if err := c.sendQuery(m); err != nil {
-					c.log.Printf("[ERR] mdns: Failed to query instance %s: %v", inp.Name, err)
+				if inp.complete() {
+					inp.sent = true
+					select {
+					case params.Entries <- inp:
+					default:
+					}
+				} else {
+					// Fire off a node specific query
+					m := new(dns.Msg)
+					m.SetQuestion(inp.Name, dns.TypePTR)
+					m.RecursionDesired = false
+					if err := c.sendQuery(m); err != nil {
+						c.log.Printf("[ERR] mdns: Failed to query instance %s: %v", inp.Name, err)
+					}
 				}
 			}
 		case <-finish:
